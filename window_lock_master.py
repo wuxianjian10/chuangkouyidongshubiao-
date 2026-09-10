@@ -284,7 +284,7 @@ dwmapi.DwmGetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c
 
 # ---------------------------------------------------------------- 工具函数
 APP_NAME = "WindowLockMaster"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 APP_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP_NAME)
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 LOG_PATH = os.path.join(APP_DIR, "app.log")
@@ -1734,7 +1734,8 @@ class WindowLockMasterApp:
         self.window_search_var.trace_add("write", lambda *_: self._refresh_window_list())
         ttk.Label(search, text="  右键窗口进行更多操作  ·  双击锁定", style="Sub.TLabel").pack(side="right")
         bar = ttk.Frame(outer, style="App.TFrame"); bar.pack(fill="x", pady=(0, 10))
-        for text, fn in [("锁定勾选", self._lock_selected_window), ("解锁勾选", self._unlock_selected_window),
+        for text, fn in [("全选（排除黑名单）", self._check_all_non_blacklisted), ("清除勾选", self._clear_checked_windows),
+                         ("锁定勾选", self._lock_selected_window), ("解锁勾选", self._unlock_selected_window),
                          ("移动到显示器 1", lambda: self._move_selected_to(0)),
                          ("移动到显示器 2", lambda: self._move_selected_to(1)),
                          ("下一个显示器", lambda: self._move_selected(1)),
@@ -1798,14 +1799,34 @@ class WindowLockMasterApp:
         if not hasattr(self, "window_tree"):
             return []
         valid = []
+        for hwnd in list(self.checked_windows):
+            if IsWindow(hwnd) and is_normal_top_window(hwnd):
+                valid.append(hwnd)
+            else:
+                self.checked_windows.discard(hwnd)
+        return valid
+
+    def _check_all_non_blacklisted(self):
+        """Check every window currently shown in the list except blacklist entries."""
+        if not hasattr(self, "window_tree"):
+            return
+        selected = set()
         for item in self.window_tree.get_children():
             try:
                 hwnd = int(item)
-                if hwnd in self.checked_windows:
-                    valid.append(hwnd)
             except ValueError:
-                pass
-        return valid
+                continue
+            proc = get_process_name(hwnd)
+            title = get_window_title(hwnd)
+            if IsWindow(hwnd) and not self.is_blacklisted(proc, title):
+                selected.add(hwnd)
+        self.checked_windows = selected
+        self._refresh_window_list()
+        self.notify(f"已全选 {len(selected)} 个窗口（已排除黑名单）")
+
+    def _clear_checked_windows(self):
+        self.checked_windows.clear()
+        self._refresh_window_list()
 
     def _toggle_window_check(self, event):
         item = self.window_tree.identify_row(event.y)
