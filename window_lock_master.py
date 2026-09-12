@@ -284,7 +284,7 @@ dwmapi.DwmGetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c
 
 # ---------------------------------------------------------------- 工具函数
 APP_NAME = "WindowLockMaster"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.20"
 APP_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP_NAME)
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 LOG_PATH = os.path.join(APP_DIR, "app.log")
@@ -527,6 +527,8 @@ class WindowLockMasterApp:
         self.monitors = enum_monitors()
         self.locked = {}                       # hwnd -> dict(mon, proc, cls, title, t)
         self.checked_windows = set()           # 主界面自定义勾选的窗口句柄
+        self.window_sort_column = "process"   # 默认按程序排序，避免动态标题导致列表跳动
+        self.window_sort_reverse = False
         self.mouse_lock_mon = None             # 鼠标锁定的显示器索引, None=未锁定
         self.mouse_prev_rect = None            # 鼠标锁定前的光标位置(恢复用)
         self.hook_installed = False
@@ -760,26 +762,12 @@ class WindowLockMasterApp:
             self.notify("只有一个显示器, 无法转移")
             return False
         target = (cur + direction) % n
-        area = self.monitors[target].rc_monitor
-        w = min(rect.width, area.width)
-        h = min(rect.height, area.height)
-        x = area.left + (area.width - w) // 2
-        y = area.top + (area.height - h) // 2
-        was_zoomed = IsZoomed(hwnd)
-        was_iconic = IsIconic(hwnd)
-        if was_iconic:
-            user32.ShowWindow(hwnd, SW_RESTORE)
-        if was_zoomed:
-            user32.ShowWindow(hwnd, SW_RESTORE)
-        user32.SetWindowPos(hwnd, None, x, y, w, h,
-                            SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS)
-        if was_zoomed:
-            user32.ShowWindow(hwnd, SW_MAXIMIZE)
-        # 若该窗口已锁定, 跟随转移(重新绑定锁定显示器)
-        with self.lock:
-            if hwnd in self.locked:
-                self.locked[hwnd]["mon"] = target
-                self.save()
+        actual = self._move_hwnd_to_monitor(hwnd, target)
+        if actual != target:
+            if self.cfg["flash_feedback"]:
+                self.flash_window(hwnd, "#FFD740")
+            self.notify(f"移动失败，目标显示器 {target + 1} 验证未通过: {get_window_title(hwnd) or get_process_name(hwnd)}")
+            return False
         if self.cfg["flash_feedback"]:
             self.flash_window(hwnd, "#FFD740")
         self.notify(f"已移到 {self.monitors[target].label}: {get_window_title(hwnd) or get_process_name(hwnd)}")
@@ -1664,53 +1652,69 @@ class WindowLockMasterApp:
         root = tk.Toplevel(self.root)
         self.settings_win = root
         root.title(f"{APP_NAME}  ·  窗口管理")
-        root.geometry("1180x780")
+        root.geometry("1240x820")
         root.minsize(900, 620)
-        root.configure(bg="#111827")
+        root.configure(bg="#F4F7FB")
         style = ttk.Style(root)
         try: style.theme_use("clam")
         except Exception: pass
-        style.configure("App.TFrame", background="#111827")
-        style.configure("Card.TLabelframe", background="#1f2937", foreground="#dbeafe", bordercolor="#374151")
-        style.configure("Card.TLabelframe.Label", background="#1f2937", foreground="#93c5fd")
-        style.configure("Title.TLabel", background="#111827", foreground="#f9fafb", font=("Segoe UI", 20, "bold"))
-        style.configure("Sub.TLabel", background="#111827", foreground="#94a3b8", font=("Segoe UI", 10))
-        style.configure("Stat.TLabel", background="#1f2937", foreground="#f9fafb", font=("Segoe UI", 13, "bold"))
-        style.configure("Treeview", background="#172033", fieldbackground="#172033", foreground="#e5e7eb", rowheight=32, borderwidth=0)
-        style.configure("Treeview.Heading", background="#263449", foreground="#bfdbfe", font=("Segoe UI", 10, "bold"), relief="flat")
-        style.map("Treeview", background=[("selected", "#2563eb")], foreground=[("selected", "#ffffff")])
+        style.configure("App.TFrame", background="#F4F7FB")
+        style.configure("Card.TLabelframe", background="#FFFFFF", foreground="#17213A", bordercolor="#D8E1EE", relief="flat")
+        style.configure("Card.TLabelframe.Label", background="#FFFFFF", foreground="#17213A", font=("Segoe UI", 10, "bold"))
+        style.configure("Title.TLabel", background="#F4F7FB", foreground="#17213A", font=("Segoe UI", 22, "bold"))
+        style.configure("Sub.TLabel", background="#F4F7FB", foreground="#687791", font=("Segoe UI", 10))
+        style.configure("StatBlue.TLabel", background="#2563EB", foreground="#FFFFFF", font=("Segoe UI", 13, "bold"))
+        style.configure("StatPurple.TLabel", background="#7C3AED", foreground="#FFFFFF", font=("Segoe UI", 13, "bold"))
+        style.configure("StatOrange.TLabel", background="#EA580C", foreground="#FFFFFF", font=("Segoe UI", 13, "bold"))
+        # 彩色按钮：高亮上沿 + raised relief，模拟轻微渐变和投影感。
+        button_common = {"relief": "raised", "borderwidth": 2, "padding": (12, 7), "font": ("Segoe UI", 9, "bold")}
+        style.configure("Flat.TButton", **button_common, background="#FFFFFF", foreground="#24324B", bordercolor="#B9C7DA")
+        style.configure("Primary.TButton", **button_common, background="#18B8B0", foreground="#FFFFFF", bordercolor="#087F7A")
+        style.configure("Blue.TButton", **button_common, background="#3F7CFF", foreground="#FFFFFF", bordercolor="#1748B5")
+        style.configure("Purple.TButton", **button_common, background="#955CFF", foreground="#FFFFFF", bordercolor="#5420B5")
+        style.configure("Orange.TButton", **button_common, background="#FF8A3D", foreground="#FFFFFF", bordercolor="#B94A0A")
+        style.configure("Danger.TButton", **button_common, background="#F05261", foreground="#FFFFFF", bordercolor="#9F1F2C")
+        style.map("Flat.TButton", background=[("pressed", "#DCE5F1"), ("active", "#F3F7FC")], relief=[("pressed", "sunken")])
+        style.map("Primary.TButton", background=[("pressed", "#087F7A"), ("active", "#27C9C1")], relief=[("pressed", "sunken")])
+        style.map("Blue.TButton", background=[("pressed", "#1748B5"), ("active", "#5A91FF")], relief=[("pressed", "sunken")])
+        style.map("Purple.TButton", background=[("pressed", "#5420B5"), ("active", "#A875FF")], relief=[("pressed", "sunken")])
+        style.map("Orange.TButton", background=[("pressed", "#B94A0A"), ("active", "#FF9F62")], relief=[("pressed", "sunken")])
+        style.map("Danger.TButton", background=[("pressed", "#9F1F2C"), ("active", "#FF6876")], relief=[("pressed", "sunken")])
+        style.configure("Treeview", background="#FFFFFF", fieldbackground="#FFFFFF", foreground="#24324B", rowheight=34, borderwidth=0, relief="flat", font=("Segoe UI", 9))
+        style.configure("Treeview.Heading", background="#E8EEF7", foreground="#31415B", font=("Segoe UI", 10, "bold"), relief="flat", padding=(8, 8))
+        style.map("Treeview", background=[("selected", "#DCEBFF")], foreground=[("selected", "#163258")])
         root.protocol("WM_DELETE_WINDOW", lambda: (setattr(self, "settings_win", None), root.destroy()))
 
         # Modern desktop shell: compact navigation rail + focused work area.
-        shell = tk.Frame(root, bg="#111827")
+        shell = tk.Frame(root, bg="#F4F7FB")
         shell.pack(fill="both", expand=True)
-        rail = tk.Frame(shell, bg="#0b1220", width=220)
+        rail = tk.Frame(shell, bg="#17213A", width=220)
         rail.pack(side="left", fill="y")
         rail.pack_propagate(False)
-        tk.Label(rail, text="WLM", bg="#0b1220", fg="#67e8f9",
+        tk.Label(rail, text="WLM", bg="#17213A", fg="#5EEAD4",
                  font=("Segoe UI", 22, "bold")).pack(anchor="w", padx=22, pady=(24, 0))
-        tk.Label(rail, text="WINDOW LOCK MASTER", bg="#0b1220", fg="#64748b",
+        tk.Label(rail, text="WINDOW LOCK MASTER", bg="#17213A", fg="#AAB8D0",
                  font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=24, pady=(0, 28))
-        tk.Label(rail, text="WORKSPACE", bg="#0b1220", fg="#475569",
+        tk.Label(rail, text="WORKSPACE", bg="#17213A", fg="#8291AD",
                  font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=24, pady=(0, 8))
-        tk.Label(rail, text="▣   窗口管理", bg="#172554", fg="#e0f2fe",
+        tk.Label(rail, text="▣   窗口管理", bg="#2563EB", fg="#FFFFFF",
                  anchor="w", padx=18, pady=11, font=("Segoe UI", 10, "bold")).pack(fill="x", padx=10)
-        tk.Label(rail, text="◉   鼠标范围", bg="#0b1220", fg="#94a3b8",
+        tk.Label(rail, text="◉   鼠标范围", bg="#17213A", fg="#CBD5E1",
                  anchor="w", padx=18, pady=11, font=("Segoe UI", 10)).pack(fill="x", padx=10)
-        tk.Label(rail, text="⌕   快捷操作", bg="#0b1220", fg="#94a3b8",
+        tk.Label(rail, text="⌕   快捷操作", bg="#17213A", fg="#CBD5E1",
                  anchor="w", padx=18, pady=11, font=("Segoe UI", 10)).pack(fill="x", padx=10)
-        tk.Frame(rail, bg="#1e293b", height=1).pack(fill="x", padx=22, pady=24)
-        tk.Label(rail, text="LIVE STATUS", bg="#0b1220", fg="#475569",
+        tk.Frame(rail, bg="#33415C", height=1).pack(fill="x", padx=22, pady=24)
+        tk.Label(rail, text="LIVE STATUS", bg="#17213A", fg="#8291AD",
                  font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=24, pady=(0, 10))
-        self.rail_status = tk.Label(rail, text="●  SERVICE ACTIVE", bg="#0b1220", fg="#34d399",
+        self.rail_status = tk.Label(rail, text="●  SERVICE ACTIVE", bg="#17213A", fg="#5EEAD4",
                                     font=("Segoe UI", 9, "bold"))
         self.rail_status.pack(anchor="w", padx=24)
-        tk.Label(rail, text="WinEvent monitor online\nGlobal hotkeys ready", bg="#0b1220", fg="#64748b",
+        tk.Label(rail, text="WinEvent monitor online\nGlobal hotkeys ready", bg="#17213A", fg="#AAB8D0",
                  justify="left", font=("Segoe UI", 9), pady=8).pack(anchor="w", padx=24)
         tk.Label(rail, text="Ctrl+Alt+L  锁定窗口\nCtrl+Alt+U  解锁窗口\nCtrl+Alt+M  锁定鼠标\nCtrl+Alt+Shift+M  解锁鼠标",
-                 bg="#0b1220", fg="#64748b", justify="left", font=("Consolas", 8), pady=18).pack(anchor="w", padx=24, side="bottom")
+                 bg="#17213A", fg="#AAB8D0", justify="left", font=("Consolas", 8), pady=18).pack(anchor="w", padx=24, side="bottom")
 
-        content = tk.Frame(shell, bg="#111827")
+        content = tk.Frame(shell, bg="#F4F7FB")
         content.pack(side="left", fill="both", expand=True)
         outer = ttk.Frame(content, style="App.TFrame", padding=22); outer.pack(fill="both", expand=True)
         header = ttk.Frame(outer, style="App.TFrame"); header.pack(fill="x", pady=(0, 14))
@@ -1718,13 +1722,13 @@ class WindowLockMasterApp:
         ttk.Label(title_box, text="窗口管理", style="Title.TLabel").pack(anchor="w")
         ttk.Label(title_box, text="集中管理多显示器窗口、锁定状态和鼠标范围", style="Sub.TLabel").pack(anchor="w", pady=(3,0))
         self.window_count_label = ttk.Label(header, text="", style="Sub.TLabel"); self.window_count_label.pack(side="left", padx=24, pady=(10,0))
-        ttk.Button(header, text="⟳  刷新", command=self._refresh_window_list).pack(side="right", pady=(10,0))
-        ttk.Button(header, text="全部解锁", command=self.unlock_all).pack(side="right", padx=(0,8), pady=(10,0))
+        ttk.Button(header, text="⟳  刷新", style="Flat.TButton", command=self._refresh_window_list).pack(side="right", pady=(10,0))
+        ttk.Button(header, text="全部解锁", style="Danger.TButton", command=self.unlock_all).pack(side="right", padx=(0,8), pady=(10,0))
 
         stats = ttk.Frame(outer, style="App.TFrame"); stats.pack(fill="x", pady=(0,12))
-        self.stat_total = ttk.Label(stats, text="窗口  0", style="Stat.TLabel", padding=(16,10)); self.stat_total.pack(side="left", fill="x", expand=True, padx=(0,8))
-        self.stat_locked = ttk.Label(stats, text="已锁定  0", style="Stat.TLabel", padding=(16,10)); self.stat_locked.pack(side="left", fill="x", expand=True, padx=8)
-        self.stat_mouse = ttk.Label(stats, text="鼠标  未锁定", style="Stat.TLabel", padding=(16,10)); self.stat_mouse.pack(side="left", fill="x", expand=True, padx=(8,0))
+        self.stat_total = ttk.Label(stats, text="窗口  0", style="StatBlue.TLabel", padding=(16,10)); self.stat_total.pack(side="left", fill="x", expand=True, padx=(0,8))
+        self.stat_locked = ttk.Label(stats, text="已锁定  0", style="StatPurple.TLabel", padding=(16,10)); self.stat_locked.pack(side="left", fill="x", expand=True, padx=8)
+        self.stat_mouse = ttk.Label(stats, text="鼠标  未锁定", style="StatOrange.TLabel", padding=(16,10)); self.stat_mouse.pack(side="left", fill="x", expand=True, padx=(8,0))
 
         search = ttk.Frame(outer, style="App.TFrame"); search.pack(fill="x", pady=(0,10))
         ttk.Label(search, text="筛选窗口", style="Sub.TLabel").pack(side="left", padx=(0,8))
@@ -1734,25 +1738,26 @@ class WindowLockMasterApp:
         self.window_search_var.trace_add("write", lambda *_: self._refresh_window_list())
         ttk.Label(search, text="  右键窗口进行更多操作  ·  双击锁定", style="Sub.TLabel").pack(side="right")
         bar = ttk.Frame(outer, style="App.TFrame"); bar.pack(fill="x", pady=(0, 10))
+        action_styles = {"全选（排除黑名单）": "Primary.TButton", "清除勾选": "Flat.TButton", "锁定勾选": "Purple.TButton", "解锁勾选": "Danger.TButton", "移动到显示器 1": "Blue.TButton", "移动到显示器 2": "Blue.TButton", "下一个显示器": "Orange.TButton", "上一个显示器": "Orange.TButton"}
         for text, fn in [("全选（排除黑名单）", self._check_all_non_blacklisted), ("清除勾选", self._clear_checked_windows),
                          ("锁定勾选", self._lock_selected_window), ("解锁勾选", self._unlock_selected_window),
                          ("移动到显示器 1", lambda: self._move_selected_to(0)),
                          ("移动到显示器 2", lambda: self._move_selected_to(1)),
                          ("下一个显示器", lambda: self._move_selected(1)),
                          ("上一个显示器", lambda: self._move_selected(-1))]:
-            ttk.Button(bar, text=text, command=fn).pack(side="left", padx=(0, 5))
+            ttk.Button(bar, text=text, style=action_styles[text], command=fn).pack(side="left", padx=(0, 5))
         cols = ("check", "title", "process", "monitor", "status", "size")
         table_card = ttk.Frame(outer, style="App.TFrame"); table_card.pack(fill="both", expand=True)
         tree = ttk.Treeview(table_card, columns=cols, show="headings", selectmode="browse")
         self.window_tree = tree
         for col, text, width in [("check","选择",56),("title","窗口标题",320),("process","程序",150),("monitor","所在显示器",180),("status","状态",90),("size","尺寸",105)]:
-            tree.heading(col, text=text); tree.column(col, width=width, anchor="w")
+            tree.heading(col, text=text, command=lambda c=col: self._sort_window_list(c)); tree.column(col, width=width, anchor="w")
         tree.pack(side="left", fill="both", expand=True)
         sb = ttk.Scrollbar(table_card, orient="vertical", command=tree.yview); sb.pack(side="right", fill="y"); tree.configure(yscrollcommand=sb.set)
         tree.bind("<Button-3>", self._window_list_context_menu)
         tree.bind("<Button-1>", self._toggle_window_check)
         tree.bind("<Double-1>", lambda e: self._lock_selected_window())
-        ttk.Label(outer, text="提示：无边框播放器、游戏窗口也会显示在列表中。", style="Sub.TLabel").pack(fill="x", pady=(8,4))
+        ttk.Label(outer, text="提示：点击表头排序；无边框播放器、游戏窗口也会显示在列表中。", style="Sub.TLabel").pack(fill="x", pady=(8,4))
 
         # 鼠标锁定
         mouse_frame = ttk.LabelFrame(outer, text="鼠标锁定范围", style="Card.TLabelframe", padding=8)
@@ -1828,6 +1833,24 @@ class WindowLockMasterApp:
         self.checked_windows.clear()
         self._refresh_window_list()
 
+    def _sort_window_list(self, column):
+        if column == "check":
+            return
+        if self.window_sort_column == column:
+            self.window_sort_reverse = not self.window_sort_reverse
+        else:
+            self.window_sort_column = column
+            self.window_sort_reverse = False
+        self._refresh_window_list()
+
+    def _update_window_sort_headings(self):
+        labels = {"check": "选择", "title": "窗口标题", "process": "程序",
+                  "monitor": "所在显示器", "status": "状态", "size": "尺寸"}
+        for column, label in labels.items():
+            if column == self.window_sort_column:
+                label += "  ▼" if self.window_sort_reverse else "  ▲"
+            self.window_tree.heading(column, text=label)
+
     def _toggle_window_check(self, event):
         item = self.window_tree.identify_row(event.y)
         if not item:
@@ -1845,6 +1868,7 @@ class WindowLockMasterApp:
     def _refresh_window_list(self):
         if self.settings_win is None or not hasattr(self, "window_tree"): return
         tree = self.window_tree; old = tree.selection(); old_id = old[0] if old else None
+        self._update_window_sort_headings()
         checked = set(self.checked_windows)
         query = self.window_search_var.get().strip().lower() if hasattr(self, "window_search_var") else ""
         for i in tree.get_children(): tree.delete(i)
@@ -1860,7 +1884,8 @@ class WindowLockMasterApp:
             if query and query not in title.lower() and query not in proc.lower():
                 continue
             rows.append((title.lower(), str(hwnd), title, proc, mon, status, f"{rect.width} × {rect.height}", "☑" if hwnd in checked else "☐"))
-        rows.sort()
+        sort_index = {"title": 2, "process": 3, "monitor": 4, "status": 5, "size": 6}.get(self.window_sort_column, 2)
+        rows.sort(key=lambda row: (str(row[sort_index]).casefold(), int(row[1])), reverse=self.window_sort_reverse)
         for _, iid, title, proc, mon, status, size, check in rows:
             hwnd = int(iid)
             tag = "locked" if status == "已锁定" else ("blacklisted" if status == "黑名单" else ("minimized" if status == "最小化" else ""))
@@ -1905,37 +1930,54 @@ class WindowLockMasterApp:
         for hwnd in hwnds:
             if self.is_blacklisted(get_process_name(hwnd), get_window_title(hwnd)):
                 skipped += 1; continue
-            if self._move_hwnd_to_monitor(hwnd, target) is not None:
+            actual = self._move_hwnd_to_monitor(hwnd, target)
+            if actual == target:
                 moved += 1
         self.notify(f"已移动 {moved} 个窗口" + (f"，跳过黑名单 {skipped} 个" if skipped else ""))
         self._refresh_window_list()
 
     def _move_hwnd_to_monitor(self, hwnd, target):
-        """Move one window to a specific monitor; used by single/batch actions."""
+        """移动并验证；成功立即停止，失败最多重试 5 次。"""
         rect = get_window_rect(hwnd)
         if not rect:
-            return
+            return None
+        current = monitor_of_rect(rect, self.monitors)
+        if current == target:
+            log(f"窗口已在目标显示器，无需移动 hwnd={hwnd} 显示器={target + 1}")
+            return target
+        old_locked_mon = self.locked[hwnd]["mon"] if hwnd in self.locked else None
+        if hwnd in self.locked:
+            # 防止锁定维护线程在验证期间把窗口拉回原显示器。
+            self.locked[hwnd]["mon"] = target
         was_zoomed = IsZoomed(hwnd)
         if IsIconic(hwnd) or was_zoomed:
             user32.ShowWindow(hwnd, SW_RESTORE)
             time.sleep(0.08)
             rect = get_window_rect(hwnd) or rect
-        # 主动移动使用完整显示器区域，避免任务栏工作区造成位置/尺寸误判。
         area = self.monitors[target].rc_monitor
         w = min(max(rect.width, 80), area.width)
         h = min(max(rect.height, 50), area.height)
         x = area.left + (area.width - w) // 2
         y = area.top + (area.height - h) // 2
-        user32.SetWindowPos(hwnd, None, x, y, w, h,
-                            SWP_NOZORDER | SWP_NOACTIVATE)
-        if was_zoomed:
-            user32.ShowWindow(hwnd, SW_MAXIMIZE)
-        if hwnd in self.locked: self.locked[hwnd]["mon"] = target; self.save()
-        moved = get_window_rect(hwnd)
-        if moved:
-            actual = monitor_of_rect(moved, self.monitors)
-            return actual
-        return None
+        actual = None
+        for attempt in range(1, 6):
+            user32.SetWindowPos(hwnd, None, x, y, w, h,
+                                SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS)
+            if was_zoomed:
+                user32.ShowWindow(hwnd, SW_MAXIMIZE)
+            time.sleep(0.10)
+            moved = get_window_rect(hwnd)
+            actual = monitor_of_rect(moved, self.monitors) if moved else None
+            if actual == target:
+                if hwnd in self.locked:
+                    self.save()
+                return target
+            log(f"移动验证失败 hwnd={hwnd} 目标={target + 1} 实际={None if actual is None else actual + 1}，继续移动 {attempt}/5")
+            if was_zoomed:
+                user32.ShowWindow(hwnd, SW_RESTORE)
+        if hwnd in self.locked:
+            self.locked[hwnd]["mon"] = old_locked_mon
+        return actual
 
     def _window_list_context_menu(self, event):
         item = self.window_tree.identify_row(event.y)
