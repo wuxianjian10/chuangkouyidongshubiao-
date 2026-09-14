@@ -3,6 +3,8 @@ __pycache__/
 *.pyc
 build/
 dist/
+build_release_*/
+build_work_*/
 *.spec
 *.log
 config.json

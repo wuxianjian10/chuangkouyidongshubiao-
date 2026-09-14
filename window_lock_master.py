@@ -284,7 +284,7 @@ dwmapi.DwmGetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c
 
 # ---------------------------------------------------------------- 工具函数
 APP_NAME = "WindowLockMaster"
-APP_VERSION = "1.0.20"
+APP_VERSION = "1.0.21"
 APP_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP_NAME)
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 LOG_PATH = os.path.join(APP_DIR, "app.log")
@@ -529,6 +529,7 @@ class WindowLockMasterApp:
         self.checked_windows = set()           # 主界面自定义勾选的窗口句柄
         self.window_sort_column = "process"   # 默认按程序排序，避免动态标题导致列表跳动
         self.window_sort_reverse = False
+        self.moving_windows = set()             # 显式移动期间暂停锁定纠正
         self.mouse_lock_mon = None             # 鼠标锁定的显示器索引, None=未锁定
         self.mouse_prev_rect = None            # 鼠标锁定前的光标位置(恢复用)
         self.hook_installed = False
@@ -666,7 +667,7 @@ class WindowLockMasterApp:
         self.last_clamp[hwnd] = now
         with self.lock:
             info = self.locked.get(hwnd)
-            if not info or not IsWindow(hwnd):
+            if not info or not IsWindow(hwnd) or hwnd in self.moving_windows:
                 return
             mon_idx = info["mon"]
         if mon_idx >= len(self.monitors):
@@ -753,16 +754,27 @@ class WindowLockMasterApp:
         if self.is_blacklisted(get_process_name(hwnd), get_window_title(hwnd)):
             self.notify("黑名单窗口不会移动")
             return False
+        was_iconic = IsIconic(hwnd)
+        if was_iconic:
+            # 最小化窗口的矩形只是占位值，先恢复才能确定真实所属显示器。
+            user32.ShowWindow(hwnd, SW_RESTORE)
+            time.sleep(0.12)
         rect = get_window_rect(hwnd)
         if not rect:
+            if was_iconic:
+                user32.ShowWindow(hwnd, SW_MINIMIZE)
             return False
         cur = monitor_of_rect(rect, self.monitors)
         n = len(self.monitors)
         if n <= 1:
+            if was_iconic:
+                user32.ShowWindow(hwnd, SW_MINIMIZE)
             self.notify("只有一个显示器, 无法转移")
             return False
         target = (cur + direction) % n
         actual = self._move_hwnd_to_monitor(hwnd, target)
+        if was_iconic and IsWindow(hwnd):
+            user32.ShowWindow(hwnd, SW_MINIMIZE)
         if actual != target:
             if self.cfg["flash_feedback"]:
                 self.flash_window(hwnd, "#FFD740")
@@ -1091,7 +1103,7 @@ class WindowLockMasterApp:
             hwnd = int(hwnd)
         if not hwnd or not self.locked:
             return
-        if hwnd in self.locked and IsWindow(hwnd) and not IsIconic(hwnd):
+        if hwnd in self.locked and IsWindow(hwnd) and not IsIconic(hwnd) and hwnd not in self.moving_windows:
             self.clamp_window(hwnd)
 
     # ---------------- 后台线程: 定时强制
@@ -1117,7 +1129,8 @@ class WindowLockMasterApp:
                             self.locked.pop(hwnd, None)
                 # 钳制
                 for hwnd in list(self.locked.keys()):
-                    self.clamp_window(hwnd)
+                    if hwnd not in self.moving_windows:
+                        self.clamp_window(hwnd)
                 # 鼠标锁定维持
                 self.enforce_mouse_lock()
             except Exception as e:
@@ -1804,10 +1817,16 @@ class WindowLockMasterApp:
         if not hasattr(self, "window_tree"):
             return []
         valid = []
-        for hwnd in list(self.checked_windows):
-            if IsWindow(hwnd) and is_normal_top_window(hwnd):
+        # 严格按 Treeview 当前排序顺序执行，避免 set 无序导致批量移动顺序乱跳。
+        for item in self.window_tree.get_children():
+            try:
+                hwnd = int(item)
+            except ValueError:
+                continue
+            if hwnd in self.checked_windows and IsWindow(hwnd) and is_normal_top_window(hwnd):
                 valid.append(hwnd)
-            else:
+        for hwnd in list(self.checked_windows):
+            if not IsWindow(hwnd) or not is_normal_top_window(hwnd):
                 self.checked_windows.discard(hwnd)
         return valid
 
@@ -1878,7 +1897,10 @@ class WindowLockMasterApp:
             if not rect: continue
             title = get_window_title(hwnd) or "（无标题）"; proc = get_process_name(hwnd) or "未知"
             mi = self.locked[hwnd]["mon"] if hwnd in self.locked else monitor_of_rect(rect, self.monitors)
-            mon = self.monitors[mi].label if mi < len(self.monitors) else "未知"
+            if IsIconic(hwnd):
+                mon = "最小化（恢复后判定）"
+            else:
+                mon = self.monitors[mi].label if mi < len(self.monitors) else "未知"
             blacklisted = self.is_blacklisted(proc, title)
             status = "黑名单" if blacklisted else ("已锁定" if hwnd in self.locked else ("最小化" if IsIconic(hwnd) else "未锁定"))
             if query and query not in title.lower() and query not in proc.lower():
@@ -1937,47 +1959,62 @@ class WindowLockMasterApp:
         self._refresh_window_list()
 
     def _move_hwnd_to_monitor(self, hwnd, target):
-        """移动并验证；成功立即停止，失败最多重试 5 次。"""
-        rect = get_window_rect(hwnd)
-        if not rect:
+        """移动并验证；最小化窗口先恢复后再判定实际显示器。"""
+        if not hwnd or not IsWindow(hwnd) or target < 0 or target >= len(self.monitors):
             return None
-        current = monitor_of_rect(rect, self.monitors)
-        if current == target:
-            log(f"窗口已在目标显示器，无需移动 hwnd={hwnd} 显示器={target + 1}")
-            return target
-        old_locked_mon = self.locked[hwnd]["mon"] if hwnd in self.locked else None
-        if hwnd in self.locked:
-            # 防止锁定维护线程在验证期间把窗口拉回原显示器。
-            self.locked[hwnd]["mon"] = target
-        was_zoomed = IsZoomed(hwnd)
-        if IsIconic(hwnd) or was_zoomed:
-            user32.ShowWindow(hwnd, SW_RESTORE)
-            time.sleep(0.08)
-            rect = get_window_rect(hwnd) or rect
-        area = self.monitors[target].rc_monitor
-        w = min(max(rect.width, 80), area.width)
-        h = min(max(rect.height, 50), area.height)
-        x = area.left + (area.width - w) // 2
-        y = area.top + (area.height - h) // 2
-        actual = None
-        for attempt in range(1, 6):
-            user32.SetWindowPos(hwnd, None, x, y, w, h,
-                                SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS)
+        self.moving_windows.add(hwnd)
+        try:
+            was_zoomed = IsZoomed(hwnd)
+            was_iconic = IsIconic(hwnd)
+            rect = get_window_rect(hwnd)
+            if not rect:
+                return None
+            old_locked_mon = self.locked[hwnd]["mon"] if hwnd in self.locked else None
+            if was_iconic or was_zoomed:
+                user32.ShowWindow(hwnd, SW_RESTORE)
+                time.sleep(0.12)
+                rect = get_window_rect(hwnd) or rect
+            current = monitor_of_rect(rect, self.monitors)
+            if current == target:
+                log(f"窗口已在目标显示器，无需移动 hwnd={hwnd} 显示器={target + 1}")
+                if was_zoomed:
+                    user32.ShowWindow(hwnd, SW_MAXIMIZE)
+                if was_iconic:
+                    user32.ShowWindow(hwnd, SW_MINIMIZE)
+                return target
+            area = self.monitors[target].rc_monitor
+            w = min(max(rect.width, 80), area.width)
+            h = min(max(rect.height, 50), area.height)
+            x = area.left + (area.width - w) // 2
+            y = area.top + (area.height - h) // 2
+            actual = None
+            for attempt in range(1, 6):
+                user32.SetWindowPos(hwnd, None, x, y, w, h,
+                                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS)
+                time.sleep(0.12)
+                moved = get_window_rect(hwnd)
+                actual = monitor_of_rect(moved, self.monitors) if moved else None
+                if actual == target:
+                    if hwnd in self.locked:
+                        self.locked[hwnd]["mon"] = target
+                        self.save()
+                    if was_zoomed:
+                        user32.ShowWindow(hwnd, SW_MAXIMIZE)
+                    if was_iconic:
+                        user32.ShowWindow(hwnd, SW_MINIMIZE)
+                    return target
+                log(f"移动验证失败 hwnd={hwnd} 目标={target + 1} 实际={None if actual is None else actual + 1}，继续移动 {attempt}/5")
+                if was_zoomed:
+                    user32.ShowWindow(hwnd, SW_RESTORE)
+            if hwnd in self.locked:
+                self.locked[hwnd]["mon"] = old_locked_mon
             if was_zoomed:
                 user32.ShowWindow(hwnd, SW_MAXIMIZE)
-            time.sleep(0.10)
-            moved = get_window_rect(hwnd)
-            actual = monitor_of_rect(moved, self.monitors) if moved else None
-            if actual == target:
-                if hwnd in self.locked:
-                    self.save()
-                return target
-            log(f"移动验证失败 hwnd={hwnd} 目标={target + 1} 实际={None if actual is None else actual + 1}，继续移动 {attempt}/5")
-            if was_zoomed:
-                user32.ShowWindow(hwnd, SW_RESTORE)
-        if hwnd in self.locked:
-            self.locked[hwnd]["mon"] = old_locked_mon
-        return actual
+            if was_iconic:
+                user32.ShowWindow(hwnd, SW_MINIMIZE)
+            return actual
+        finally:
+            self.moving_windows.discard(hwnd)
 
     def _window_list_context_menu(self, event):
         item = self.window_tree.identify_row(event.y)
