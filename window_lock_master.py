@@ -284,7 +284,7 @@ dwmapi.DwmGetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c
 
 # ---------------------------------------------------------------- 工具函数
 APP_NAME = "WindowLockMaster"
-APP_VERSION = "1.0.21"
+APP_VERSION = "1.0.22"
 APP_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP_NAME)
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 LOG_PATH = os.path.join(APP_DIR, "app.log")
@@ -1936,6 +1936,18 @@ class WindowLockMasterApp:
         for hwnd in hwnds: self.unlock_window(hwnd)
         if hwnds: self._refresh_window_list()
 
+    def _restore_selected_windows(self):
+        """仅恢复显示，不移动窗口、不修改锁定绑定。"""
+        hwnds = self._checked_hwnds() or ([self._list_selected_hwnd()] if self._list_selected_hwnd() else [])
+        restored = 0
+        for hwnd in hwnds:
+            if IsWindow(hwnd) and IsIconic(hwnd):
+                user32.ShowWindow(hwnd, SW_RESTORE)
+                restored += 1
+        if hwnds:
+            self.notify(f"已解除最小化 {restored}/{len(hwnds)} 个窗口")
+            self._refresh_window_list()
+
     def _move_selected(self, direction):
         hwnds = self._checked_hwnds() or ([self._list_selected_hwnd()] if self._list_selected_hwnd() else [])
         moved = skipped = 0
@@ -2026,6 +2038,7 @@ class WindowLockMasterApp:
         scope = f"已勾选 {checked_count} 个窗口" if checked_count else "当前窗口"
         menu.add_command(label=f"锁定（{scope}）", command=self._lock_selected_window)
         menu.add_command(label=f"解锁（{scope}）", command=self._unlock_selected_window)
+        menu.add_command(label=f"解除最小化（{scope}）", command=self._restore_selected_windows)
         menu.add_command(label=f"移动到显示器 1（{scope}）", command=lambda: self._move_selected_to(0))
         if len(self.monitors) > 1: menu.add_command(label=f"移动到显示器 2（{scope}）", command=lambda: self._move_selected_to(1))
         menu.add_command(label=f"移动到下一个显示器（{scope}）", command=lambda: self._move_selected(1))
