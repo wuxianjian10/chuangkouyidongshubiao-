@@ -66,6 +66,8 @@ DWMWA_CLOAKED = 14
 WH_MOUSE_LL = 14
 WH_KEYBOARD_LL = 13
 WM_RBUTTONUP = 0x0205
+WM_LBUTTONUP = 0x0202
+WM_LBUTTONDBLCLK = 0x0203
 WM_HOTKEY = 0x0312
 WM_KEYDOWN = 0x0100
 WM_SYSKEYDOWN = 0x0104
@@ -284,7 +286,7 @@ dwmapi.DwmGetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c
 
 # ---------------------------------------------------------------- 工具函数
 APP_NAME = "WindowLockMaster"
-APP_VERSION = "1.0.22"
+APP_VERSION = "1.0.23"
 APP_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), APP_NAME)
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 LOG_PATH = os.path.join(APP_DIR, "app.log")
@@ -1188,7 +1190,24 @@ class WindowLockMasterApp:
         try:
             self.tray = pystray.Icon(APP_NAME, self.make_icon(), APP_NAME,
                                      menu=self.build_tray_menu())
-            self.tray.default_action = lambda: self.action_q.put(("settings",))
+            # pystray 的 Windows 后端没有公开双击回调；接管 WM_NOTIFY
+            # 分发器，只新增左键双击处理，右键菜单和其他事件保持原逻辑。
+            try:
+                from pystray._util import win32 as tray_win32
+                original_notify = self.tray._message_handlers.get(tray_win32.WM_NOTIFY)
+
+                def tray_notify(wparam, lparam):
+                    if lparam == WM_LBUTTONDBLCLK:
+                        log("托盘双击: 打开窗口管理")
+                        self.action_q.put(("window_manager",))
+                        return
+                    if original_notify:
+                        return original_notify(wparam, lparam)
+
+                self.tray._message_handlers[tray_win32.WM_NOTIFY] = tray_notify
+                log("托盘双击处理: 已绑定")
+            except Exception as e:
+                log(f"托盘双击处理绑定失败: {e}")
             self.tray.run_detached()
             log("托盘已启动")
         except Exception as e:
@@ -1654,18 +1673,52 @@ class WindowLockMasterApp:
         self.set_mouse_lock(idx)
 
     # ---------------- 窗口列表管理器（主界面）
+    def _fit_window_to_content(self, root):
+        """按实际控件需求和当前显示器工作区设置初始尺寸。"""
+        try:
+            root.update_idletasks()
+            req_w = max(1, root.winfo_reqwidth())
+            req_h = max(1, root.winfo_reqheight())
+            pt = POINT()
+            GetCursorPos(ctypes.byref(pt))
+            idx = monitor_of_point(pt.x, pt.y, self.monitors) if self.monitors else 0
+            monitor = self.monitors[idx] if self.monitors and idx < len(self.monitors) else None
+            if monitor:
+                work = monitor.rc_work
+                max_w = max(900, work.width - 36)
+                max_h = max(620, work.height - 52)
+                width = min(max(1100, req_w + 12), max_w)
+                height = min(max(760, req_h + 12), max_h)
+                x = work.left + max(0, (work.width - width) // 2)
+                y = work.top + max(0, (work.height - height) // 2)
+                root.geometry(f"{width}x{height}+{x}+{y}")
+                root.minsize(min(width, max_w), min(height, max_h))
+                log(f"窗口自适应尺寸: req={req_w}x{req_h}, actual={width}x{height}, monitor={idx + 1}")
+            else:
+                width = max(1100, req_w + 12)
+                height = max(760, req_h + 12)
+                root.geometry(f"{width}x{height}")
+                root.minsize(width, height)
+                log(f"窗口自适应尺寸: req={req_w}x{req_h}, actual={width}x{height}")
+        except Exception as e:
+            log(f"窗口自适应尺寸失败: {e}")
+
     def _open_window_manager(self):
         import tkinter as tk
         from tkinter import ttk
         if self.settings_win is not None:
             try:
-                self.settings_win.deiconify(); self.settings_win.lift(); return
+                self.settings_win.deiconify()
+                self.settings_win.state("normal")
+                self.settings_win.lift()
+                self.settings_win.focus_force()
+                return
             except Exception:
                 self.settings_win = None
         root = tk.Toplevel(self.root)
         self.settings_win = root
-        root.title(f"{APP_NAME}  ·  窗口管理")
-        root.geometry("1240x820")
+        root.title(f"{APP_NAME} v{APP_VERSION}  ·  窗口管理")
+        root.geometry("1100x760")
         root.minsize(900, 620)
         root.configure(bg="#F4F7FB")
         style = ttk.Style(root)
@@ -1800,6 +1853,7 @@ class WindowLockMasterApp:
         self._refresh_window_blacklist()
         self._update_window_mouse_status()
         self._refresh_window_list()
+        self._fit_window_to_content(root)
         root.after(1500, self._periodic_window_refresh)
 
     def _periodic_window_refresh(self):
